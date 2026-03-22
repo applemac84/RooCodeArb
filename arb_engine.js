@@ -418,7 +418,7 @@ class ArbEngine {
         // ── Pure arb state ──────────────────────────────────────────────
         this.btcArbFiredWindow = null;  // per-window dedup for BTC arb
         this.ethArbFiredWindow = null;  // per-window dedup for ETH arb
-        this.arbThreshold      = 0.03;  // 3% minimum net gap after fees
+        this.arbThreshold      = 0.01;  // 1% minimum net gap after fees (combined asks < 0.97)
         this.arbTakerFee       = 0.01;  // 1% per side (Polymarket taker fee)
 
         // Telegram control panel
@@ -669,6 +669,21 @@ class ArbEngine {
                 const arbGap   = 1.0 - combined;
                 const netGap   = arbGap - (2 * this.arbTakerFee);  // subtract fees for both legs
 
+                // Also check raw mids for comparison (mids can sum < 1.00 when asks don't)
+                const upMid    = polyData.upRawMid;
+                const downMid  = polyData.downRawMid;
+                const combinedMid = (upMid != null && downMid != null) ? upMid + downMid : null;
+
+                // Diagnostic: log combined ask/mid every 30 ticks (~60s) so we can calibrate
+                if (this.tickCount % 30 === 0) {
+                    const midStr = combinedMid != null ? `${(combinedMid*100).toFixed(1)}¢` : 'N/A';
+                    console.log(
+                        `[ARB-diag] BTC asks=${(combined*100).toFixed(1)}¢ mids=${midStr} ` +
+                        `gap=${(arbGap*100).toFixed(1)}¢ net=${(netGap*100).toFixed(1)}¢ ` +
+                        `threshold=${(this.arbThreshold*100).toFixed(1)}¢`
+                    );
+                }
+
                 if (netGap > this.arbThreshold && this.btcArbFiredWindow !== polyData.slug) {
                     const gapCents = (arbGap * 100).toFixed(1);
                     const netCents = (netGap * 100).toFixed(1);
@@ -757,6 +772,19 @@ class ArbEngine {
                     const ethCombined = ethUpAsk + ethDownAsk;
                     const ethArbGap   = 1.0 - ethCombined;
                     const ethNetGap   = ethArbGap - (2 * this.arbTakerFee);
+
+                    const ethMidUp  = ethData.upRawMid;
+                    const ethMidDn  = ethData.downRawMid;
+                    const ethCombinedMid = (ethMidUp != null && ethMidDn != null) ? ethMidUp + ethMidDn : null;
+
+                    if (this.tickCount % 30 === 0) {
+                        const midStr = ethCombinedMid != null ? `${(ethCombinedMid*100).toFixed(1)}¢` : 'N/A';
+                        console.log(
+                            `[ARB-diag] ETH asks=${(ethCombined*100).toFixed(1)}¢ mids=${midStr} ` +
+                            `gap=${(ethArbGap*100).toFixed(1)}¢ net=${(ethNetGap*100).toFixed(1)}¢ ` +
+                            `threshold=${(this.arbThreshold*100).toFixed(1)}¢`
+                        );
+                    }
 
                     const ethArbSlug = ethData.slug || `eth-updown-5m-${ethData.windowTs}`;
 
