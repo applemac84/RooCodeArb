@@ -712,7 +712,7 @@ class ArbEngine {
                         if (arbLiquidityOk) {
                             this.btcArbFiredWindow = polyData.slug;
 
-                            const budget    = Math.max(1.00, this.paperBalance * 0.005);
+                            const budget    = Math.max(1.00, this.paperBalance * 0.03);  // 3% of bankroll — arb is guaranteed profit
                             const N         = budget / combinedAsk;
                             const upCost    = N * upAsk;
                             const downCost  = N * downAsk;
@@ -818,7 +818,7 @@ class ArbEngine {
                             if (ethArbLiquidityOk) {
                                 this.ethArbFiredWindow = ethArbSlug;
 
-                                const ethBudget    = Math.max(1.00, this.paperBalance * 0.005);
+                                const ethBudget    = Math.max(1.00, this.paperBalance * 0.03);  // 3% — arb is guaranteed profit
                                 const ethN         = ethBudget / ethCombinedAsk;
                                 const ethNetProfit = ethN * ethNetGap;
 
