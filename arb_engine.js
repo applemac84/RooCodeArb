@@ -159,6 +159,7 @@ try { db.exec('ALTER TABLE paper_trades ADD COLUMN had_up_signal_300s INTEGER DE
 try { db.exec('ALTER TABLE paper_trades ADD COLUMN max_up_edge_recent REAL'); } catch (_) {}
 try { db.exec('ALTER TABLE paper_trades ADD COLUMN secs_since_last_up_signal REAL'); } catch (_) {}
 try { db.exec('ALTER TABLE paper_trades ADD COLUMN seconds_at_entry INTEGER'); } catch (_) {}
+try { db.exec('ALTER TABLE paper_trades ADD COLUMN trade_mode TEXT DEFAULT \'paper\''); } catch (_) {}
 // Add suppression_flags column to existing DBs (no-op if already present)
 try { db.exec('ALTER TABLE signals ADD COLUMN suppression_flags TEXT'); } catch (_) {}
 try { db.exec('ALTER TABLE signals ADD COLUMN near_threshold INTEGER DEFAULT 0'); } catch (_) {}
@@ -410,6 +411,16 @@ class ArbEngine {
         this.pendingResolution    = null;  // { prevSlug, prevK } for BTC
         this.pendingEthResolution = null;  // { prevEthSlug, prevEthK } for ETH
 
+        // ── Per-strategy mode switch (paper/live) ──────────────────────
+        this.lagMode = 'paper';   // 'paper' or 'live' — lag detector mode
+        this.arbMode = 'paper';   // 'paper' or 'live' — pure arb mode
+
+        // ── Pure arb state ──────────────────────────────────────────────
+        this.btcArbFiredWindow = null;  // per-window dedup for BTC arb
+        this.ethArbFiredWindow = null;  // per-window dedup for ETH arb
+        this.arbThreshold      = 0.01;  // 1% minimum net gap after fees (combined asks < 0.97)
+        this.arbTakerFee       = 0.01;  // 1% per side (Polymarket taker fee)
+
         // Telegram control panel
         this.control = new TelegramControl(this);
     }
@@ -633,6 +644,7 @@ class ArbEngine {
                 this.lastWindowTs = windowTs;
                 this.lastRolloverTime = Date.now();
                 this.btcWindowTradeCount = 0;
+                this.btcArbFiredWindow = null;  // allow arb in new window
                 console.log(`\n[Engine] 🔄 Window rolled: ${polyData.slug}`);
                 this.bayesian.reset();
                 this.spreadModel.reset();
@@ -645,27 +657,112 @@ class ArbEngine {
                 this.lastWindowTs = windowTs;
             }
 
-            // ── Pure arbitrage scanner ────────────────────────────────────
-            // If priceUp + priceDown < 0.98, buying both sides guarantees
-            // profit regardless of outcome. No model needed — pure math.
-            // Seen in the reference trader's ETH data (Mar 14).
-            if (polyData.spread !== null && polyData.priceUp && polyData.priceDown) {
-                const sumPrices = polyData.priceUp + polyData.priceDown;
-                const arbGap    = 1.0 - sumPrices;
-                if (arbGap > 0.02) {  // > 2¢ gap after fees
-                    const gapCents = (arbGap * 100).toFixed(1);
-                    const msg = `🎰 PURE ARB DETECTED\n` +
-                        `📍 ${polyData.slug}\n` +
-                        `⏱ ${polyData.secondsRemaining}s remaining\n` +
-                        `UP:   ${(polyData.priceUp*100).toFixed(1)}¢\n` +
-                        `DOWN: ${(polyData.priceDown*100).toFixed(1)}¢\n` +
-                        `Sum:  ${(sumPrices*100).toFixed(1)}¢ (< 100¢)\n` +
-                        `Gap:  ${gapCents}¢/share — guaranteed profit\n\n` +
-                        `🟡 PAPER MODE — no order placed`;
-                    console.log(`[Engine] 🎰 PURE ARB: ${polyData.slug} | ` +
-                        `UP=${(polyData.priceUp*100).toFixed(1)}¢ + DOWN=${(polyData.priceDown*100).toFixed(1)}¢ ` +
-                        `= ${(sumPrices*100).toFixed(1)}¢ | Gap=${gapCents}¢`);
-                    await sendTelegram(msg);
+            // ── Pure arbitrage scanner (TRADEABLE — hybrid detection) ────
+            // DETECT on raw mids (independent book midpoints can sum < $1.00)
+            // ENTER on asks (actual execution prices)
+            // Only TRADE if ask-based profit is still positive after fees
+            //
+            // Why hybrid: asks always include spread markup, so combined asks
+            // almost never dip below $1.00. But combined mids CAN, and if the
+            // spread is tight enough, the ask-based entry still profits.
+            if (polyData.upRawMid != null && polyData.downRawMid != null) {
+                const upMid     = polyData.upRawMid;
+                const downMid   = polyData.downRawMid;
+                const combinedMid = upMid + downMid;
+                const midGap    = 1.0 - combinedMid;
+
+                const upAsk     = polyData.bestAsk;
+                const downAsk   = polyData.downBestAsk;
+                const combinedAsk = (upAsk != null && downAsk != null) ? upAsk + downAsk : null;
+                const askGap    = combinedAsk != null ? 1.0 - combinedAsk : null;
+                const netGap    = askGap != null ? askGap - (2 * this.arbTakerFee) : null;
+
+                // Diagnostic: log every 30 ticks (~60s)
+                if (this.tickCount % 30 === 0) {
+                    const askStr = combinedAsk != null ? `${(combinedAsk*100).toFixed(1)}¢` : 'N/A';
+                    const askGapStr = askGap != null ? `${(askGap*100).toFixed(1)}¢` : 'N/A';
+                    const netStr = netGap != null ? `${(netGap*100).toFixed(1)}¢` : 'N/A';
+                    console.log(
+                        `[ARB-diag] BTC mids=${(combinedMid*100).toFixed(1)}¢ midGap=${(midGap*100).toFixed(1)}¢ ` +
+                        `asks=${askStr} askGap=${askGapStr} net=${netStr} ` +
+                        `upSpd=${polyData.spread != null ? (polyData.spread*100).toFixed(0)+'%' : 'N/A'} ` +
+                        `dnSpd=${polyData.downSpread != null ? (polyData.downSpread*100).toFixed(0)+'%' : 'N/A'}`
+                    );
+                }
+
+                // Stage 1: mid-based detection (mids sum < $1.00 minus fee buffer)
+                if (midGap > (2 * this.arbTakerFee) && this.btcArbFiredWindow !== polyData.slug) {
+
+                    // Stage 2: verify ask-based profit is still positive after fees
+                    if (combinedAsk != null && netGap != null && netGap > this.arbThreshold) {
+                        const gapCents = (askGap * 100).toFixed(1);
+                        const netCents = (netGap * 100).toFixed(1);
+
+                        console.log(`[Engine] 🎰 BTC PURE ARB TRADEABLE: ${polyData.slug} | ` +
+                            `mids=${(combinedMid*100).toFixed(1)}¢ asks=${(combinedAsk*100).toFixed(1)}¢ ` +
+                            `askGap=${gapCents}¢ net=${netCents}¢`);
+
+                        // Liquidity check — both books must have tight spreads
+                        const arbLiquidityOk =
+                            polyData.liquidity !== 'illiquid' &&
+                            polyData.downLiquidity !== 'illiquid' &&
+                            (polyData.spread ?? 1) < 0.10 &&
+                            (polyData.downSpread ?? 1) < 0.10;
+
+                        if (arbLiquidityOk) {
+                            this.btcArbFiredWindow = polyData.slug;
+
+                            const budget    = Math.max(1.00, this.paperBalance * 0.03);  // 3% of bankroll — arb is guaranteed profit
+                            const N         = budget / combinedAsk;
+                            const upCost    = N * upAsk;
+                            const downCost  = N * downAsk;
+                            const netProfit = N * netGap;
+
+                            const arbTimestamp = new Date().toISOString();
+                            const upCtx = getUpContext();
+                            const modeBadge = this.arbMode === 'live' ? 'LIVE' : 'PAPER';
+
+                            insertPaperTrade.run(
+                                arbTimestamp, polyData.slug, 'UP',
+                                upAsk, upCost, N, 1.0, netGap * 100,
+                                this.paperBalance, 'ARB',
+                                upCtx.had60s, upCtx.had300s, upCtx.maxEdge, upCtx.secsAgo,
+                                polyData.secondsRemaining
+                            );
+
+                            insertPaperTrade.run(
+                                arbTimestamp, polyData.slug, 'DOWN',
+                                downAsk, downCost, N, 1.0, netGap * 100,
+                                this.paperBalance, 'ARB',
+                                upCtx.had60s, upCtx.had300s, upCtx.maxEdge, upCtx.secsAgo,
+                                polyData.secondsRemaining
+                            );
+
+                            this.sessionBtcTrades += 2;
+                            console.log(
+                                `[Paper] 🎰 BTC ARB legs recorded — ${N.toFixed(2)} shares/leg ` +
+                                `UP@${(upAsk*100).toFixed(1)}¢ DOWN@${(downAsk*100).toFixed(1)}¢ ` +
+                                `guaranteed net +$${netProfit.toFixed(2)}`
+                            );
+
+                            await sendTelegram(
+                                `🎰 <b>BTC ARB TRADE — BOTH LEGS</b>\n` +
+                                `📍 ${polyData.slug} | ${polyData.secondsRemaining}s\n` +
+                                `UP @ ${(upAsk*100).toFixed(1)}¢ (ask)   DOWN @ ${(downAsk*100).toFixed(1)}¢ (ask)\n` +
+                                `Combined: ${(combinedAsk*100).toFixed(1)}¢ → +${gapCents}¢/share (${netCents}¢ net)\n` +
+                                `Shares: ${N.toFixed(2)}  Stake: $${budget.toFixed(2)}  Net P&L: +$${netProfit.toFixed(2)}\n` +
+                                `🟡 ${modeBadge} MODE`
+                            );
+                        } else {
+                            console.log(`[Engine] 🎰 BTC ARB mid-gap detected but spreads too wide`);
+                        }
+                    } else if (midGap > 0.03) {
+                        // Mid gap is significant but asks don't profit — log for analysis
+                        console.log(
+                            `[ARB-near] BTC midGap=${(midGap*100).toFixed(1)}¢ but askGap=${askGap != null ? (askGap*100).toFixed(1)+'¢' : 'N/A'} ` +
+                            `— spread eats the edge`
+                        );
+                    }
                 }
             }
 
@@ -674,26 +771,102 @@ class ArbEngine {
             const ethData = this.lastEthData;
             if (ethData && ethData.priceUp && ethData.priceDown) {
 
-                // ETH pure arb scanner
-                const ethSumPrices = ethData.priceUp + ethData.priceDown;
-                const ethArbGap    = 1.0 - ethSumPrices;
-                if (ethArbGap > 0.02) {
-                    const gapCents = (ethArbGap * 100).toFixed(1);
-                    console.log(
-                        `[Engine] 🎰 ETH PURE ARB: ${ethData.slug} | ` +
-                        `UP=${(ethData.priceUp*100).toFixed(1)}¢ + DOWN=${(ethData.priceDown*100).toFixed(1)}¢ ` +
-                        `= ${(ethSumPrices*100).toFixed(1)}¢ | Gap=${gapCents}¢`
-                    );
-                    await sendTelegram(
-                        `🎰 <b>ETH PURE ARB DETECTED</b>\n` +
-                        `📍 ${ethData.slug}\n` +
-                        `⏱ ${ethData.secondsRemaining}s remaining\n` +
-                        `UP:   ${(ethData.priceUp*100).toFixed(1)}¢\n` +
-                        `DOWN: ${(ethData.priceDown*100).toFixed(1)}¢\n` +
-                        `Sum:  ${(ethSumPrices*100).toFixed(1)}¢ (< 100¢)\n` +
-                        `Gap:  ${gapCents}¢/share — guaranteed profit if both sides filled\n\n` +
-                        `🟡 PAPER MODE — no order placed`
-                    );
+                // ── ETH pure arb scanner (TRADEABLE — hybrid detection) ──────
+                // Same hybrid approach as BTC: detect on mids, enter on asks
+                if (ethData.upRawMid != null && ethData.downRawMid != null) {
+                    const ethUpMid     = ethData.upRawMid;
+                    const ethDownMid   = ethData.downRawMid;
+                    const ethCombinedMid = ethUpMid + ethDownMid;
+                    const ethMidGap    = 1.0 - ethCombinedMid;
+
+                    const ethUpAsk     = ethData.bestAsk;
+                    const ethDownAsk   = ethData.downBestAsk;
+                    const ethCombinedAsk = (ethUpAsk != null && ethDownAsk != null) ? ethUpAsk + ethDownAsk : null;
+                    const ethAskGap    = ethCombinedAsk != null ? 1.0 - ethCombinedAsk : null;
+                    const ethNetGap    = ethAskGap != null ? ethAskGap - (2 * this.arbTakerFee) : null;
+
+                    if (this.tickCount % 30 === 0) {
+                        const askStr = ethCombinedAsk != null ? `${(ethCombinedAsk*100).toFixed(1)}¢` : 'N/A';
+                        const askGapStr = ethAskGap != null ? `${(ethAskGap*100).toFixed(1)}¢` : 'N/A';
+                        const netStr = ethNetGap != null ? `${(ethNetGap*100).toFixed(1)}¢` : 'N/A';
+                        console.log(
+                            `[ARB-diag] ETH mids=${(ethCombinedMid*100).toFixed(1)}¢ midGap=${(ethMidGap*100).toFixed(1)}¢ ` +
+                            `asks=${askStr} askGap=${askGapStr} net=${netStr} ` +
+                            `upSpd=${ethData.spread != null ? (ethData.spread*100).toFixed(0)+'%' : 'N/A'} ` +
+                            `dnSpd=${ethData.downSpread != null ? (ethData.downSpread*100).toFixed(0)+'%' : 'N/A'}`
+                        );
+                    }
+
+                    const ethArbSlug = ethData.slug || `eth-updown-5m-${ethData.windowTs}`;
+
+                    if (ethMidGap > (2 * this.arbTakerFee) && this.ethArbFiredWindow !== ethArbSlug) {
+
+                        if (ethCombinedAsk != null && ethNetGap != null && ethNetGap > this.arbThreshold) {
+                            const gapCents = (ethAskGap * 100).toFixed(1);
+                            const netCents = (ethNetGap * 100).toFixed(1);
+
+                            console.log(`[Engine] 🎰 ETH PURE ARB TRADEABLE: ${ethArbSlug} | ` +
+                                `mids=${(ethCombinedMid*100).toFixed(1)}¢ asks=${(ethCombinedAsk*100).toFixed(1)}¢ ` +
+                                `askGap=${gapCents}¢ net=${netCents}¢`);
+
+                            const ethArbLiquidityOk =
+                                ethData.liquidity !== 'illiquid' &&
+                                ethData.downLiquidity !== 'illiquid' &&
+                                (ethData.spread ?? 1) < 0.10 &&
+                                (ethData.downSpread ?? 1) < 0.10;
+
+                            if (ethArbLiquidityOk) {
+                                this.ethArbFiredWindow = ethArbSlug;
+
+                                const ethBudget    = Math.max(1.00, this.paperBalance * 0.03);  // 3% — arb is guaranteed profit
+                                const ethN         = ethBudget / ethCombinedAsk;
+                                const ethNetProfit = ethN * ethNetGap;
+
+                                const ethArbTs = new Date().toISOString();
+                                const ethUpCtx = getUpContext();
+                                const ethModeBadge = this.arbMode === 'live' ? 'LIVE' : 'PAPER';
+
+                                insertPaperTrade.run(
+                                    ethArbTs, ethArbSlug, 'UP',
+                                    ethUpAsk, ethN * ethUpAsk, ethN, 1.0, ethNetGap * 100,
+                                    this.paperBalance, 'ARB',
+                                    ethUpCtx.had60s, ethUpCtx.had300s, ethUpCtx.maxEdge, ethUpCtx.secsAgo,
+                                    ethData.secondsRemaining
+                                );
+
+                                insertPaperTrade.run(
+                                    ethArbTs, ethArbSlug, 'DOWN',
+                                    ethDownAsk, ethN * ethDownAsk, ethN, 1.0, ethNetGap * 100,
+                                    this.paperBalance, 'ARB',
+                                    ethUpCtx.had60s, ethUpCtx.had300s, ethUpCtx.maxEdge, ethUpCtx.secsAgo,
+                                    ethData.secondsRemaining
+                                );
+
+                                this.sessionEthTrades += 2;
+                                console.log(
+                                    `[Paper] 🎰 ETH ARB legs recorded — ${ethN.toFixed(2)} shares/leg ` +
+                                    `UP@${(ethUpAsk*100).toFixed(1)}¢ DOWN@${(ethDownAsk*100).toFixed(1)}¢ ` +
+                                    `guaranteed net +$${ethNetProfit.toFixed(2)}`
+                                );
+
+                                await sendTelegram(
+                                    `Ξ 🎰 <b>ETH ARB TRADE — BOTH LEGS</b>\n` +
+                                    `📍 ${ethArbSlug} | ${ethData.secondsRemaining}s\n` +
+                                    `UP @ ${(ethUpAsk*100).toFixed(1)}¢ (ask)   DOWN @ ${(ethDownAsk*100).toFixed(1)}¢ (ask)\n` +
+                                    `Combined: ${(ethCombinedAsk*100).toFixed(1)}¢ → +${gapCents}¢/share (${netCents}¢ net)\n` +
+                                    `Shares: ${ethN.toFixed(2)}  Stake: $${ethBudget.toFixed(2)}  Net P&L: +$${ethNetProfit.toFixed(2)}\n` +
+                                    `🟡 ${ethModeBadge} MODE`
+                                );
+                            } else {
+                                console.log(`[Engine] 🎰 ETH ARB mid-gap detected but spreads too wide`);
+                            }
+                        } else if (ethMidGap > 0.03) {
+                            console.log(
+                                `[ARB-near] ETH midGap=${(ethMidGap*100).toFixed(1)}¢ but askGap=${ethAskGap != null ? (ethAskGap*100).toFixed(1)+'¢' : 'N/A'} ` +
+                                `— spread eats the edge`
+                            );
+                        }
+                    }
                 }
 
                 // ETH directional signal — same Bayesian model, ETH reference price
@@ -721,6 +894,7 @@ class ArbEngine {
                         const prevEthWindowTs = this.ethWindowTs;
                         this.ethWindowTs = ethData.windowTs; // close re-entry window before any await
                         this.ethWindowTradeCount = 0;
+                        this.ethArbFiredWindow = null;  // allow arb in new ETH window
                         const prevEthSlug = `eth-updown-5m-${prevEthWindowTs}`;
                         const prevEthK    = this.ethBayesian.openingPrice;
                         const finalEthCL  = rtdsState.ethChainlinkPrice;
@@ -1447,6 +1621,8 @@ class ArbEngine {
                 losses:            trades.losses || 0,
                 current_window:    this.lastWindowTs ? `btc-updown-5m-${this.lastWindowTs}` : null,
                 rtds_connected:    this.rtds?.connected || false,
+                lag_mode:          this.lagMode,
+                arb_mode:          this.arbMode,
                 btc_density_10min: density?.tradeable_10min || 0,
                 eth_density_10min: ethDensity?.tradeable_10min || 0,
                 rolling_wr_20:     rolling20?.wr || 0,
