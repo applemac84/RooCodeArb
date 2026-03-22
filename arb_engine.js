@@ -657,103 +657,110 @@ class ArbEngine {
                 this.lastWindowTs = windowTs;
             }
 
-            // ── Pure arbitrage scanner (TRADEABLE) ────────────────────────
-            // Uses ASK prices from both independent orderbooks.
-            // If UP_ask + DOWN_ask < $1.00 (after fees), buying equal shares
-            // on both sides guarantees profit regardless of outcome.
-            // Equal shares = identical profit whether UP or DOWN resolves.
-            if (polyData.bestAsk != null && polyData.downBestAsk != null) {
-                const upAsk    = polyData.bestAsk;
-                const downAsk  = polyData.downBestAsk;
-                const combined = upAsk + downAsk;
-                const arbGap   = 1.0 - combined;
-                const netGap   = arbGap - (2 * this.arbTakerFee);  // subtract fees for both legs
+            // ── Pure arbitrage scanner (TRADEABLE — hybrid detection) ────
+            // DETECT on raw mids (independent book midpoints can sum < $1.00)
+            // ENTER on asks (actual execution prices)
+            // Only TRADE if ask-based profit is still positive after fees
+            //
+            // Why hybrid: asks always include spread markup, so combined asks
+            // almost never dip below $1.00. But combined mids CAN, and if the
+            // spread is tight enough, the ask-based entry still profits.
+            if (polyData.upRawMid != null && polyData.downRawMid != null) {
+                const upMid     = polyData.upRawMid;
+                const downMid   = polyData.downRawMid;
+                const combinedMid = upMid + downMid;
+                const midGap    = 1.0 - combinedMid;
 
-                // Also check raw mids for comparison (mids can sum < 1.00 when asks don't)
-                const upMid    = polyData.upRawMid;
-                const downMid  = polyData.downRawMid;
-                const combinedMid = (upMid != null && downMid != null) ? upMid + downMid : null;
+                const upAsk     = polyData.bestAsk;
+                const downAsk   = polyData.downBestAsk;
+                const combinedAsk = (upAsk != null && downAsk != null) ? upAsk + downAsk : null;
+                const askGap    = combinedAsk != null ? 1.0 - combinedAsk : null;
+                const netGap    = askGap != null ? askGap - (2 * this.arbTakerFee) : null;
 
-                // Diagnostic: log combined ask/mid every 30 ticks (~60s) so we can calibrate
+                // Diagnostic: log every 30 ticks (~60s)
                 if (this.tickCount % 30 === 0) {
-                    const midStr = combinedMid != null ? `${(combinedMid*100).toFixed(1)}¢` : 'N/A';
+                    const askStr = combinedAsk != null ? `${(combinedAsk*100).toFixed(1)}¢` : 'N/A';
+                    const askGapStr = askGap != null ? `${(askGap*100).toFixed(1)}¢` : 'N/A';
+                    const netStr = netGap != null ? `${(netGap*100).toFixed(1)}¢` : 'N/A';
                     console.log(
-                        `[ARB-diag] BTC asks=${(combined*100).toFixed(1)}¢ mids=${midStr} ` +
-                        `gap=${(arbGap*100).toFixed(1)}¢ net=${(netGap*100).toFixed(1)}¢ ` +
-                        `threshold=${(this.arbThreshold*100).toFixed(1)}¢`
+                        `[ARB-diag] BTC mids=${(combinedMid*100).toFixed(1)}¢ midGap=${(midGap*100).toFixed(1)}¢ ` +
+                        `asks=${askStr} askGap=${askGapStr} net=${netStr} ` +
+                        `upSpd=${polyData.spread != null ? (polyData.spread*100).toFixed(0)+'%' : 'N/A'} ` +
+                        `dnSpd=${polyData.downSpread != null ? (polyData.downSpread*100).toFixed(0)+'%' : 'N/A'}`
                     );
                 }
 
-                if (netGap > this.arbThreshold && this.btcArbFiredWindow !== polyData.slug) {
-                    const gapCents = (arbGap * 100).toFixed(1);
-                    const netCents = (netGap * 100).toFixed(1);
+                // Stage 1: mid-based detection (mids sum < $1.00 minus fee buffer)
+                if (midGap > (2 * this.arbTakerFee) && this.btcArbFiredWindow !== polyData.slug) {
 
-                    console.log(`[Engine] 🎰 BTC PURE ARB TRADEABLE: ${polyData.slug} | ` +
-                        `UP_ask=${(upAsk*100).toFixed(1)}¢ + DOWN_ask=${(downAsk*100).toFixed(1)}¢ ` +
-                        `= ${(combined*100).toFixed(1)}¢ | Gap=${gapCents}¢ Net=${netCents}¢`);
+                    // Stage 2: verify ask-based profit is still positive after fees
+                    if (combinedAsk != null && netGap != null && netGap > this.arbThreshold) {
+                        const gapCents = (askGap * 100).toFixed(1);
+                        const netCents = (netGap * 100).toFixed(1);
 
-                    // Liquidity check — both books must be active
-                    const arbLiquidityOk =
-                        polyData.liquidity !== 'illiquid' &&
-                        polyData.downLiquidity !== 'illiquid' &&
-                        (polyData.downSpread ?? 1) < 0.10;
+                        console.log(`[Engine] 🎰 BTC PURE ARB TRADEABLE: ${polyData.slug} | ` +
+                            `mids=${(combinedMid*100).toFixed(1)}¢ asks=${(combinedAsk*100).toFixed(1)}¢ ` +
+                            `askGap=${gapCents}¢ net=${netCents}¢`);
 
-                    if (arbLiquidityOk) {
-                        // Claim slot before any await
-                        this.btcArbFiredWindow = polyData.slug;
+                        // Liquidity check — both books must have tight spreads
+                        const arbLiquidityOk =
+                            polyData.liquidity !== 'illiquid' &&
+                            polyData.downLiquidity !== 'illiquid' &&
+                            (polyData.spread ?? 1) < 0.10 &&
+                            (polyData.downSpread ?? 1) < 0.10;
 
-                        // Equal-share sizing: N shares on each side
-                        const budget    = Math.max(1.00, this.paperBalance * 0.005);  // 0.5% of bankroll
-                        const N         = budget / combined;    // equal shares per leg
-                        const upCost    = N * upAsk;
-                        const downCost  = N * downAsk;
-                        const guaranteedProfit = N * arbGap;    // before fees
-                        const netProfit = N * netGap;           // after fees
+                        if (arbLiquidityOk) {
+                            this.btcArbFiredWindow = polyData.slug;
 
-                        const arbTimestamp = new Date().toISOString();
-                        const upCtx = getUpContext();
-                        const modeBadge = this.arbMode === 'live' ? 'LIVE' : 'PAPER';
+                            const budget    = Math.max(1.00, this.paperBalance * 0.005);
+                            const N         = budget / combinedAsk;
+                            const upCost    = N * upAsk;
+                            const downCost  = N * downAsk;
+                            const netProfit = N * netGap;
 
-                        // Leg 1: UP
-                        insertPaperTrade.run(
-                            arbTimestamp, polyData.slug, 'UP',
-                            upAsk, upCost, N, 1.0, netGap * 100,
-                            this.paperBalance, 'ARB',
-                            upCtx.had60s, upCtx.had300s, upCtx.maxEdge, upCtx.secsAgo,
-                            polyData.secondsRemaining
-                        );
+                            const arbTimestamp = new Date().toISOString();
+                            const upCtx = getUpContext();
+                            const modeBadge = this.arbMode === 'live' ? 'LIVE' : 'PAPER';
 
-                        // Leg 2: DOWN
-                        insertPaperTrade.run(
-                            arbTimestamp, polyData.slug, 'DOWN',
-                            downAsk, downCost, N, 1.0, netGap * 100,
-                            this.paperBalance, 'ARB',
-                            upCtx.had60s, upCtx.had300s, upCtx.maxEdge, upCtx.secsAgo,
-                            polyData.secondsRemaining
-                        );
+                            insertPaperTrade.run(
+                                arbTimestamp, polyData.slug, 'UP',
+                                upAsk, upCost, N, 1.0, netGap * 100,
+                                this.paperBalance, 'ARB',
+                                upCtx.had60s, upCtx.had300s, upCtx.maxEdge, upCtx.secsAgo,
+                                polyData.secondsRemaining
+                            );
 
-                        this.sessionBtcTrades += 2;
+                            insertPaperTrade.run(
+                                arbTimestamp, polyData.slug, 'DOWN',
+                                downAsk, downCost, N, 1.0, netGap * 100,
+                                this.paperBalance, 'ARB',
+                                upCtx.had60s, upCtx.had300s, upCtx.maxEdge, upCtx.secsAgo,
+                                polyData.secondsRemaining
+                            );
+
+                            this.sessionBtcTrades += 2;
+                            console.log(
+                                `[Paper] 🎰 BTC ARB legs recorded — ${N.toFixed(2)} shares/leg ` +
+                                `UP@${(upAsk*100).toFixed(1)}¢ DOWN@${(downAsk*100).toFixed(1)}¢ ` +
+                                `guaranteed net +$${netProfit.toFixed(2)}`
+                            );
+
+                            await sendTelegram(
+                                `🎰 <b>BTC ARB TRADE — BOTH LEGS</b>\n` +
+                                `📍 ${polyData.slug} | ${polyData.secondsRemaining}s\n` +
+                                `UP @ ${(upAsk*100).toFixed(1)}¢ (ask)   DOWN @ ${(downAsk*100).toFixed(1)}¢ (ask)\n` +
+                                `Combined: ${(combinedAsk*100).toFixed(1)}¢ → +${gapCents}¢/share (${netCents}¢ net)\n` +
+                                `Shares: ${N.toFixed(2)}  Stake: $${budget.toFixed(2)}  Net P&L: +$${netProfit.toFixed(2)}\n` +
+                                `🟡 ${modeBadge} MODE`
+                            );
+                        } else {
+                            console.log(`[Engine] 🎰 BTC ARB mid-gap detected but spreads too wide`);
+                        }
+                    } else if (midGap > 0.03) {
+                        // Mid gap is significant but asks don't profit — log for analysis
                         console.log(
-                            `[Paper] 🎰 BTC ARB legs recorded — ${N.toFixed(2)} shares/leg ` +
-                            `UP@${(upAsk*100).toFixed(1)}¢ DOWN@${(downAsk*100).toFixed(1)}¢ ` +
-                            `guaranteed net +$${netProfit.toFixed(2)}`
-                        );
-
-                        await sendTelegram(
-                            `🎰 <b>BTC ARB TRADE — BOTH LEGS</b>\n` +
-                            `📍 ${polyData.slug} | ${polyData.secondsRemaining}s\n` +
-                            `UP @ ${(upAsk*100).toFixed(1)}¢ (ask)   DOWN @ ${(downAsk*100).toFixed(1)}¢ (ask)\n` +
-                            `Combined: ${(combined*100).toFixed(1)}¢ → +${gapCents}¢/share (${netCents}¢ net)\n` +
-                            `Shares: ${N.toFixed(2)}  Stake: $${budget.toFixed(2)}  Net P&L: +$${netProfit.toFixed(2)}\n` +
-                            `🟡 ${modeBadge} MODE`
-                        );
-                    } else {
-                        console.log(`[Engine] 🎰 BTC PURE ARB spotted but illiquid — alert only`);
-                        await sendTelegram(
-                            `🎰 BTC ARB DETECTED (illiquid)\n` +
-                            `📍 ${polyData.slug} | ${polyData.secondsRemaining}s\n` +
-                            `UP_ask=${(upAsk*100).toFixed(1)}¢ DOWN_ask=${(downAsk*100).toFixed(1)}¢\n` +
-                            `Gap: ${gapCents}¢ — but books too thin to trade`
+                            `[ARB-near] BTC midGap=${(midGap*100).toFixed(1)}¢ but askGap=${askGap != null ? (askGap*100).toFixed(1)+'¢' : 'N/A'} ` +
+                            `— spread eats the edge`
                         );
                     }
                 }
@@ -764,91 +771,100 @@ class ArbEngine {
             const ethData = this.lastEthData;
             if (ethData && ethData.priceUp && ethData.priceDown) {
 
-                // ── ETH pure arb scanner (TRADEABLE) ────────────────────────
-                // Same logic as BTC — uses ASK prices, equal shares, per-window dedup
-                if (ethData.bestAsk != null && ethData.downBestAsk != null) {
-                    const ethUpAsk    = ethData.bestAsk;
-                    const ethDownAsk  = ethData.downBestAsk;
-                    const ethCombined = ethUpAsk + ethDownAsk;
-                    const ethArbGap   = 1.0 - ethCombined;
-                    const ethNetGap   = ethArbGap - (2 * this.arbTakerFee);
+                // ── ETH pure arb scanner (TRADEABLE — hybrid detection) ──────
+                // Same hybrid approach as BTC: detect on mids, enter on asks
+                if (ethData.upRawMid != null && ethData.downRawMid != null) {
+                    const ethUpMid     = ethData.upRawMid;
+                    const ethDownMid   = ethData.downRawMid;
+                    const ethCombinedMid = ethUpMid + ethDownMid;
+                    const ethMidGap    = 1.0 - ethCombinedMid;
 
-                    const ethMidUp  = ethData.upRawMid;
-                    const ethMidDn  = ethData.downRawMid;
-                    const ethCombinedMid = (ethMidUp != null && ethMidDn != null) ? ethMidUp + ethMidDn : null;
+                    const ethUpAsk     = ethData.bestAsk;
+                    const ethDownAsk   = ethData.downBestAsk;
+                    const ethCombinedAsk = (ethUpAsk != null && ethDownAsk != null) ? ethUpAsk + ethDownAsk : null;
+                    const ethAskGap    = ethCombinedAsk != null ? 1.0 - ethCombinedAsk : null;
+                    const ethNetGap    = ethAskGap != null ? ethAskGap - (2 * this.arbTakerFee) : null;
 
                     if (this.tickCount % 30 === 0) {
-                        const midStr = ethCombinedMid != null ? `${(ethCombinedMid*100).toFixed(1)}¢` : 'N/A';
+                        const askStr = ethCombinedAsk != null ? `${(ethCombinedAsk*100).toFixed(1)}¢` : 'N/A';
+                        const askGapStr = ethAskGap != null ? `${(ethAskGap*100).toFixed(1)}¢` : 'N/A';
+                        const netStr = ethNetGap != null ? `${(ethNetGap*100).toFixed(1)}¢` : 'N/A';
                         console.log(
-                            `[ARB-diag] ETH asks=${(ethCombined*100).toFixed(1)}¢ mids=${midStr} ` +
-                            `gap=${(ethArbGap*100).toFixed(1)}¢ net=${(ethNetGap*100).toFixed(1)}¢ ` +
-                            `threshold=${(this.arbThreshold*100).toFixed(1)}¢`
+                            `[ARB-diag] ETH mids=${(ethCombinedMid*100).toFixed(1)}¢ midGap=${(ethMidGap*100).toFixed(1)}¢ ` +
+                            `asks=${askStr} askGap=${askGapStr} net=${netStr} ` +
+                            `upSpd=${ethData.spread != null ? (ethData.spread*100).toFixed(0)+'%' : 'N/A'} ` +
+                            `dnSpd=${ethData.downSpread != null ? (ethData.downSpread*100).toFixed(0)+'%' : 'N/A'}`
                         );
                     }
 
                     const ethArbSlug = ethData.slug || `eth-updown-5m-${ethData.windowTs}`;
 
-                    if (ethNetGap > this.arbThreshold && this.ethArbFiredWindow !== ethArbSlug) {
-                        const gapCents = (ethArbGap * 100).toFixed(1);
-                        const netCents = (ethNetGap * 100).toFixed(1);
+                    if (ethMidGap > (2 * this.arbTakerFee) && this.ethArbFiredWindow !== ethArbSlug) {
 
-                        console.log(`[Engine] 🎰 ETH PURE ARB TRADEABLE: ${ethArbSlug} | ` +
-                            `UP_ask=${(ethUpAsk*100).toFixed(1)}¢ + DOWN_ask=${(ethDownAsk*100).toFixed(1)}¢ ` +
-                            `= ${(ethCombined*100).toFixed(1)}¢ | Gap=${gapCents}¢ Net=${netCents}¢`);
+                        if (ethCombinedAsk != null && ethNetGap != null && ethNetGap > this.arbThreshold) {
+                            const gapCents = (ethAskGap * 100).toFixed(1);
+                            const netCents = (ethNetGap * 100).toFixed(1);
 
-                        const ethArbLiquidityOk =
-                            ethData.liquidity !== 'illiquid' &&
-                            ethData.downLiquidity !== 'illiquid' &&
-                            (ethData.downSpread ?? 1) < 0.10;
+                            console.log(`[Engine] 🎰 ETH PURE ARB TRADEABLE: ${ethArbSlug} | ` +
+                                `mids=${(ethCombinedMid*100).toFixed(1)}¢ asks=${(ethCombinedAsk*100).toFixed(1)}¢ ` +
+                                `askGap=${gapCents}¢ net=${netCents}¢`);
 
-                        if (ethArbLiquidityOk) {
-                            this.ethArbFiredWindow = ethArbSlug;
+                            const ethArbLiquidityOk =
+                                ethData.liquidity !== 'illiquid' &&
+                                ethData.downLiquidity !== 'illiquid' &&
+                                (ethData.spread ?? 1) < 0.10 &&
+                                (ethData.downSpread ?? 1) < 0.10;
 
-                            const ethBudget    = Math.max(1.00, this.paperBalance * 0.005);
-                            const ethN         = ethBudget / ethCombined;
-                            const ethUpCost    = ethN * ethUpAsk;
-                            const ethDownCost  = ethN * ethDownAsk;
-                            const ethNetProfit = ethN * ethNetGap;
+                            if (ethArbLiquidityOk) {
+                                this.ethArbFiredWindow = ethArbSlug;
 
-                            const ethArbTs = new Date().toISOString();
-                            const ethUpCtx = getUpContext();
-                            const ethModeBadge = this.arbMode === 'live' ? 'LIVE' : 'PAPER';
+                                const ethBudget    = Math.max(1.00, this.paperBalance * 0.005);
+                                const ethN         = ethBudget / ethCombinedAsk;
+                                const ethNetProfit = ethN * ethNetGap;
 
-                            // Leg 1: UP
-                            insertPaperTrade.run(
-                                ethArbTs, ethArbSlug, 'UP',
-                                ethUpAsk, ethUpCost, ethN, 1.0, ethNetGap * 100,
-                                this.paperBalance, 'ARB',
-                                ethUpCtx.had60s, ethUpCtx.had300s, ethUpCtx.maxEdge, ethUpCtx.secsAgo,
-                                ethData.secondsRemaining
-                            );
+                                const ethArbTs = new Date().toISOString();
+                                const ethUpCtx = getUpContext();
+                                const ethModeBadge = this.arbMode === 'live' ? 'LIVE' : 'PAPER';
 
-                            // Leg 2: DOWN
-                            insertPaperTrade.run(
-                                ethArbTs, ethArbSlug, 'DOWN',
-                                ethDownAsk, ethDownCost, ethN, 1.0, ethNetGap * 100,
-                                this.paperBalance, 'ARB',
-                                ethUpCtx.had60s, ethUpCtx.had300s, ethUpCtx.maxEdge, ethUpCtx.secsAgo,
-                                ethData.secondsRemaining
-                            );
+                                insertPaperTrade.run(
+                                    ethArbTs, ethArbSlug, 'UP',
+                                    ethUpAsk, ethN * ethUpAsk, ethN, 1.0, ethNetGap * 100,
+                                    this.paperBalance, 'ARB',
+                                    ethUpCtx.had60s, ethUpCtx.had300s, ethUpCtx.maxEdge, ethUpCtx.secsAgo,
+                                    ethData.secondsRemaining
+                                );
 
-                            this.sessionEthTrades += 2;
+                                insertPaperTrade.run(
+                                    ethArbTs, ethArbSlug, 'DOWN',
+                                    ethDownAsk, ethN * ethDownAsk, ethN, 1.0, ethNetGap * 100,
+                                    this.paperBalance, 'ARB',
+                                    ethUpCtx.had60s, ethUpCtx.had300s, ethUpCtx.maxEdge, ethUpCtx.secsAgo,
+                                    ethData.secondsRemaining
+                                );
+
+                                this.sessionEthTrades += 2;
+                                console.log(
+                                    `[Paper] 🎰 ETH ARB legs recorded — ${ethN.toFixed(2)} shares/leg ` +
+                                    `UP@${(ethUpAsk*100).toFixed(1)}¢ DOWN@${(ethDownAsk*100).toFixed(1)}¢ ` +
+                                    `guaranteed net +$${ethNetProfit.toFixed(2)}`
+                                );
+
+                                await sendTelegram(
+                                    `Ξ 🎰 <b>ETH ARB TRADE — BOTH LEGS</b>\n` +
+                                    `📍 ${ethArbSlug} | ${ethData.secondsRemaining}s\n` +
+                                    `UP @ ${(ethUpAsk*100).toFixed(1)}¢ (ask)   DOWN @ ${(ethDownAsk*100).toFixed(1)}¢ (ask)\n` +
+                                    `Combined: ${(ethCombinedAsk*100).toFixed(1)}¢ → +${gapCents}¢/share (${netCents}¢ net)\n` +
+                                    `Shares: ${ethN.toFixed(2)}  Stake: $${ethBudget.toFixed(2)}  Net P&L: +$${ethNetProfit.toFixed(2)}\n` +
+                                    `🟡 ${ethModeBadge} MODE`
+                                );
+                            } else {
+                                console.log(`[Engine] 🎰 ETH ARB mid-gap detected but spreads too wide`);
+                            }
+                        } else if (ethMidGap > 0.03) {
                             console.log(
-                                `[Paper] 🎰 ETH ARB legs recorded — ${ethN.toFixed(2)} shares/leg ` +
-                                `UP@${(ethUpAsk*100).toFixed(1)}¢ DOWN@${(ethDownAsk*100).toFixed(1)}¢ ` +
-                                `guaranteed net +$${ethNetProfit.toFixed(2)}`
+                                `[ARB-near] ETH midGap=${(ethMidGap*100).toFixed(1)}¢ but askGap=${ethAskGap != null ? (ethAskGap*100).toFixed(1)+'¢' : 'N/A'} ` +
+                                `— spread eats the edge`
                             );
-
-                            await sendTelegram(
-                                `Ξ 🎰 <b>ETH ARB TRADE — BOTH LEGS</b>\n` +
-                                `📍 ${ethArbSlug} | ${ethData.secondsRemaining}s\n` +
-                                `UP @ ${(ethUpAsk*100).toFixed(1)}¢ (ask)   DOWN @ ${(ethDownAsk*100).toFixed(1)}¢ (ask)\n` +
-                                `Combined: ${(ethCombined*100).toFixed(1)}¢ → +${gapCents}¢/share (${netCents}¢ net)\n` +
-                                `Shares: ${ethN.toFixed(2)}  Stake: $${ethBudget.toFixed(2)}  Net P&L: +$${ethNetProfit.toFixed(2)}\n` +
-                                `🟡 ${ethModeBadge} MODE`
-                            );
-                        } else {
-                            console.log(`[Engine] 🎰 ETH PURE ARB spotted but illiquid — alert only`);
                         }
                     }
                 }
