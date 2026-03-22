@@ -131,6 +131,27 @@ class TelegramControl {
             case '/stop':    await this._doStop();                   break;
             case '/help':    await this.send(this._buildHelp());     break;
             case '/morning': await this.send(this._buildMorningReport()); break;
+            case '/mode':    await this.send(this._buildMode());   break;
+            case '/lag_paper': {
+                this.engine.lagMode = 'paper';
+                await this.send('Lag detector set to PAPER mode');
+                break;
+            }
+            case '/lag_live': {
+                this.engine.lagMode = 'live';
+                await this.send('⚠️ Lag detector set to LIVE mode');
+                break;
+            }
+            case '/arb_paper': {
+                this.engine.arbMode = 'paper';
+                await this.send('Arb detector set to PAPER mode');
+                break;
+            }
+            case '/arb_live': {
+                this.engine.arbMode = 'live';
+                await this.send('⚠️ Arb detector set to LIVE mode');
+                break;
+            }
             case '/hive': {
                 if (Date.now() - this.startTime < 30000) {
                     await this.send('⏳ Engine just restarted — please wait 30 seconds before running /hive');
@@ -173,6 +194,7 @@ class TelegramControl {
             `📡 <b>Engine Status</b>`,
             ``,
             `Mode:      ${this.paused ? '⏸ PAUSED' : '▶️  RUNNING'}`,
+            `Lag:       ${e.lagMode === 'live' ? '🔴 LIVE' : '🟡 PAPER'}  Arb: ${e.arbMode === 'live' ? '🔴 LIVE' : '🟡 PAPER'}`,
             `RTDS:      ${e.rtds?.connected ? '🟢 Connected' : '🔴 Disconnected'}`,
             `Ticks:     ${e.tickCount.toLocaleString()}`,
             `Signals:   ${e.signalCount} total | ${e.lagSignalCount} lag-based`,
@@ -374,11 +396,26 @@ class TelegramControl {
         }
     }
 
+    _buildMode() {
+        const e = this.engine;
+        return [
+            `⚙️ <b>Strategy Modes</b>`,
+            ``,
+            `Lag detector: ${e.lagMode === 'live' ? '🔴 LIVE' : '🟡 PAPER'}`,
+            `Arb detector: ${e.arbMode === 'live' ? '🔴 LIVE' : '🟡 PAPER'}`,
+            ``,
+            `Toggle with:`,
+            `/lag_paper  /lag_live`,
+            `/arb_paper  /arb_live`,
+        ].join('\n');
+    }
+
     _buildHelp() {
         return [
             `🤖 <b>Arb Bot Commands</b>`,
             ``,
             `/status  — engine state, RTDS, current window`,
+            `/mode    — show lag/arb paper/live modes`,
             `/pnl     — paper trade stats from database`,
             `/signals — last 5 tradeable signals`,
             `/lag     — live Chainlink vs Binance gap`,
@@ -386,6 +423,11 @@ class TelegramControl {
             `/pause   — stop signal evaluation`,
             `/resume  — restart signal evaluation`,
             `/stop    — shut down the engine`,
+            ``,
+            `<b>Mode Toggles:</b>`,
+            `/lag_paper  /lag_live`,
+            `/arb_paper  /arb_live`,
+            ``,
             `/help    — this message`,
         ].join('\n');
     }
